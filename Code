@@ -1,0 +1,309 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import models, layers, losses, metrics, callbacks, Sequential, optimizers
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+# Please note that this code is derived from an unpublished paper, so it is for reviewers only, that is, only reviewers can get the password of the dataset, but the code is public to everyone.
+# If the paper is accepted, we will publish the data set. Everyone is welcome to read the paper and use our code and data.
+
+# Paper Portal: However, not publish.
+# Author:      Hongyu Sun
+# Affiliation: Tsinghua University
+# Email:     sunhy18@mails.tsinghua.edu.cn
+
+# The software versions we used were TensorFlow 2.5 (tf-nightly-gpu 2.5.0.dev20201214), CUDA 11.1, and Python 3.8.
+# The hardware platform parameters were as follows: i9-10900K CPU, RTX-3080 GPU, and 64 GB of memory.
+# Another recommended configuration is: TensorFlow 2.2, CUDA 10.1, and Python 3.7.
+
+# The reason for the slower loading speed is the larger .csv data set to be read
+
+def Set_GPU_Memory_Growth():
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            # Set GPU memory usage to be allocated on demand
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+            print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+        except RuntimeError as e:
+            # Exception handling
+            print(e)
+    else:
+        print('No GPU')
+
+# Before creating the model instance
+Set_GPU_Memory_Growth()
+
+# --------------------
+# The absolute path of the input dataset, follows do the same
+TRAIN_dataset_path = 'train_dataset.csv'
+TEST_dataset_path  = 'test_dataset.csv'
+SAVE_PATH = 'Saved.h5'
+SAVING = 'Y' # Save 'Y' or drop 'N'
+PRINT_NUMBER = 220 # Indicates how many results from the test set to display
+EPOCHS = 150
+LEARNING_RATE = 0.0001
+# --------------------
+
+
+def get_data(file_path, shuffle_number=1000, batch_number=100):
+
+    # Improved to achieve simultaneous quantization
+    data_read = pd.read_csv(file_path, header=None) # Prevent the first line from being a header
+    data = data_read.values[:, 6:61067] # Read data
+    data_2D = tf.reshape(data, shape=[-1, 61, 1001]) # 2D
+    data_2D = tf.expand_dims(data_2D, axis=3)
+
+    label_L = []
+    label_W = []
+    label_D = []
+
+    for i in data_read.values[:, 1:2]:
+        for j in i:
+            label_L.append(j)
+    for i in data_read.values[:, 2:3]:
+        for j in i:
+            label_W.append(j)
+    for i in data_read.values[:, 3:4]:
+        for j in i:
+            label_D.append(j)
+
+    data_2D = tf.cast(data_2D, dtype=tf.float32)
+    label_L = tf.cast(label_L, dtype=tf.int32)
+    label_W = tf.cast(label_W, dtype=tf.int32)
+    label_D = tf.cast(label_D, dtype=tf.int32)
+
+    data_base = tf.data.Dataset.from_tensor_slices(
+        (data_2D, (label_L, label_W, label_D))
+    ).batch(batch_number, drop_remainder=True).shuffle(shuffle_number)
+
+    return data_base
+
+def compare(file_path = None, number = PRINT_NUMBER):
+
+    data_read = pd.read_csv(
+        filepath_or_buffer=file_path,
+        header=None)
+    data = data_read.values[:, 6:61067]
+    data_2D = tf.reshape(data, shape=[-1, 61, 1001])
+    data_2D = tf.expand_dims(data_2D, axis=3)
+
+    label_L = data_read.values[:, 1:2][0:number]
+    label_W = data_read.values[:, 2:3][0:number]
+    label_D = data_read.values[:, 3:4][0:number]
+
+    data_2D = tf.cast(data_2D[0:number], tf.float32)
+    data_2D = tf.reshape(data_2D, [number, 61, 1001, 1])
+
+    return data_2D, label_L,  label_W, label_D
+
+def main():
+
+    # Network structure definition
+    filter_0 = 3  # Initial layer's filters
+    filter_1 = 16 # First layer's filters
+    filter_2 = 32 # Second layer's filters，Should be equal or larger than the first layer's filters*2
+    filter_3 = 96 # Third layer's filters，Should be equal or larger than the second layer's filters*3
+
+    train_db = get_data(file_path=TRAIN_dataset_path)
+    test_db = get_data(file_path=TEST_dataset_path)
+
+    # ———————————————————————————————————————————— Network structure begins ————————————————————————————————————————————
+
+    # Input layer
+    inputs = layers.Input(shape=(61, 1001, 1))
+
+    # Initial layer
+    init_1   = layers.Conv2D(filters=filter_0, kernel_size=3, padding='same', activation='relu')(inputs) # The filter affects the value of 0-axis, and the kernel is set to 1 when shorted
+    init_2   = layers.MaxPooling2D(2, strides=2, padding='same')(init_1)
+    init_end = layers.BatchNormalization()(init_2)
+
+    # Convolution kernel for length and width information extraction
+    template = tf.zeros(shape=[3, 3, 3, 3], dtype=tf.float32)
+
+    length_matrix = tf.constant([
+        [-1.,-2.,-1.],
+        [ 0., 0., 0.],
+        [ 1., 2., 1.]
+    ], dtype=tf.float32) + template
+
+    width_matrix = tf.constant([
+        [-1., 0., 1.],
+        [-2., 0., 2.],
+        [-1., 0., 1.]
+    ], dtype=tf.float32) + template
+
+    branch_length_0 = tf.nn.conv2d(init_end, length_matrix, strides=[1, 1, 1, 1], padding='SAME')
+    branch_width_0 = tf.nn.conv2d(init_end, width_matrix, strides=[1, 1, 1, 1], padding='SAME')
+
+    # Length information extraction branch
+    branch_length_1 = layers.Conv2D(filter_1, 3, padding='same', activation='relu')(branch_length_0)
+    branch_length_2 = layers.MaxPooling2D(2, strides=2, padding='same')(branch_length_1)
+    branch_length_3 = layers.BatchNormalization()(branch_length_2)
+    branch_length_4 = layers.Conv2D(filter_2, 3, padding='same', activation='relu')(branch_length_3)
+    branch_length_5 = layers.MaxPooling2D(2, strides=2, padding='same')(branch_length_4)
+    branch_length_6 = layers.BatchNormalization()(branch_length_5)
+
+    # Width information extraction branch
+    branch_width_1 = layers.Conv2D(filter_1, 3, padding='same', activation='relu')(branch_width_0)
+    branch_width_2 = layers.MaxPooling2D(2, strides=2, padding='same')(branch_width_1)
+    branch_width_3 = layers.BatchNormalization()(branch_width_2)
+    branch_width_3_plus = layers.Concatenate()([branch_width_3, branch_length_3]) # The length information is added to the width judgment, connecting
+    branch_width_4 = layers.Conv2D(filter_2, 3, padding='same', activation='relu')(branch_width_3_plus)
+    branch_width_5 = layers.MaxPooling2D(2, strides=2, padding='same')(branch_width_4)
+    branch_width_6 = layers.BatchNormalization()(branch_width_5)
+
+    # Depth information extraction branch
+    branch_depth_1 = layers.Conv2D(filter_1, 3, padding='same', activation='relu')(init_end)
+    branch_depth_2 = layers.MaxPooling2D(2, strides=2, padding='same')(branch_depth_1)
+    branch_depth_3 = layers.BatchNormalization()(branch_depth_2)
+    branch_depth_4 = layers.Conv2D(filter_2, 3, padding='same', activation='relu')(branch_depth_3)
+    branch_depth_5 = layers.MaxPooling2D(2, strides=2, padding='same')(branch_depth_4)
+    branch_depth_6 = layers.BatchNormalization()(branch_depth_5)
+    branch_depth_6_plus = layers.Concatenate()([branch_depth_6, branch_length_6, branch_width_6])# Length and width information is added to the depth judgment, connecting
+    branch_depth_7 = layers.Conv2D(filter_3, 3, padding='same', activation='relu')(branch_depth_6_plus)
+    branch_depth_8 = layers.MaxPooling2D(2, strides=2, padding='same')(branch_depth_7)
+    branch_depth_9 = layers.BatchNormalization()(branch_depth_8)
+
+    # Residual shorting
+    branch_depth_3_res_1 = layers.Conv2D(filter_2, 1, padding='same', activation='relu')(branch_depth_3) # Here kernel=1
+    branch_depth_3_res_2 = layers.MaxPooling2D(2, strides=2, padding='same')(branch_depth_3_res_1)
+    branch_depth_3_res_3 = layers.Conv2D(filter_2, 1, padding='same', activation='relu')(branch_depth_3_res_2) # Here kernel=1
+    branch_depth_3_res_4 = layers.MaxPooling2D(2, strides=2, padding='same')(branch_depth_3_res_3)
+    branch_depth_3_res_3_plus = layers.Concatenate()([branch_depth_3_res_4, branch_depth_3_res_4, branch_depth_3_res_4]) # Connect itself to ensure consistent data format
+    branch_depth_9_res = layers.add([branch_depth_9, branch_depth_3_res_3_plus])
+
+    # Fully connected layer
+    # L prediction
+    main_L_1 = layers.Flatten()(branch_length_3)
+    main_L_2 = layers.Dense(128, activation='relu')(main_L_1)
+    main_L_3 = layers.Dense(32, activation='relu')(main_L_2)
+    outputs_L = layers.Dense(1)(main_L_3)
+    # W prediction
+    main_W_1 = layers.Flatten()(branch_width_6)
+    main_W_2 = layers.Dense(128, activation='relu')(main_W_1)
+    main_W_3 = layers.Dense(32, activation='relu')(main_W_2)
+    outputs_W = layers.Dense(1)(main_W_3)
+    # D prediction
+    main_D_1 = layers.Flatten()(branch_depth_9_res)
+    main_D_2 = layers.Dense(128, activation='relu')(main_D_1)
+    main_D_3 = layers.Dense(32, activation='relu')(main_D_2)
+    outputs_D = layers.Dense(1)(main_D_3)
+
+    # ———————————————————————————————————————————— End of network structure ————————————————————————————————————————————
+
+    model = models.Model(inputs=inputs, outputs=[outputs_L, outputs_W, outputs_D])
+    model.summary()
+
+    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+        monitor='val_loss',
+        patience=10,
+        verbose=1,  # 0 does not shows the current learning rate, 1 shows
+        factor=0.5,
+        min_lr=0.00001,
+        min_delta=0.001
+    )
+    early_st = tf.keras.callbacks.EarlyStopping(
+        monitor='val_loss',
+        verbose=1,
+        min_delta=0.001,  # Minimum increase
+        patience=20,
+        restore_best_weights=True  # Save the optimal weight value
+    )
+
+    model.compile(optimizer=optimizers.Nadam(LEARNING_RATE), loss=['mse','mse','mse'], metrics=['mse'])
+    History = model.fit(train_db, validation_data=test_db, epochs=EPOCHS, validation_freq=1, callbacks=[reduce_lr, early_st])
+
+    print('-------------------------------- loss')
+    print(History.history['loss'])
+    print('-------------------- loss_L')
+    print(History.history['dense_2_loss'])
+    print('-------------------- loss_W')
+    print(History.history['dense_5_loss'])
+    print('-------------------- loss_D')
+    print(History.history['dense_8_loss'])
+
+    print('-------------------------------- mse')
+    print('-------------------- mse_L')
+    print(History.history['dense_2_mse'])
+    print('-------------------- mse_W')
+    print(History.history['dense_5_mse'])
+    print('-------------------- mse_D')
+    print(History.history['dense_8_mse'])
+
+    print('-------------------------------- val_loss')
+    print(History.history['val_loss'])
+    print('-------------------- val_loss_L')
+    print(History.history['val_dense_2_loss'])
+    print('-------------------- val_loss_W')
+    print(History.history['val_dense_5_loss'])
+    print('-------------------- val_loss_D')
+    print(History.history['val_dense_8_loss'])
+
+    print('-------------------------------- val_mse')
+    print('-------------------- val_mse_L')
+    print(History.history['val_dense_2_mse'])
+    print('-------------------- val_mse_W')
+    print(History.history['val_dense_5_mse'])
+    print('-------------------- val_mse_D')
+    print(History.history['val_dense_8_mse'])
+
+    print('-------------------------------- learning rate')
+    print(History.history['lr'])
+
+    if SAVING == 'Y':
+        model.save(filepath=SAVE_PATH)
+        print('-------------------- \nModel saved successfully !\n')
+
+
+    print('后处理中...')
+    train_data, train_label_L, train_label_W, train_label_D = compare(file_path=TRAIN_dataset_path, number=PRINT_NUMBER)
+    train_result = model.predict(train_data) # train_result[0-length;1-width;2-depth][No.]
+
+    test_data, test_label_L, test_label_W, test_label_D = compare(file_path=TEST_dataset_path, number=PRINT_NUMBER)
+    test_result = model.predict(test_data)
+
+    print('---train---')
+    train_total_L = 0
+    train_total_W = 0
+    train_total_D = 0
+    for j in range(PRINT_NUMBER):
+        print('L', float(train_result[0][j]), '-', train_label_L[j], 'distance:', float(abs(train_result[0][j] - train_label_L[j])))
+        train_total_L += float(abs(train_result[0][j] - train_label_L[j]))
+        print('W', float(train_result[1][j]), '-', train_label_W[j], 'distance:', float(abs(train_result[1][j] - train_label_W[j])))
+        train_total_W += float(abs(train_result[1][j] - train_label_W[j]))
+        print('D', float(train_result[2][j]), '-', train_label_D[j], 'distance:', float(abs(train_result[2][j] - train_label_D[j])))
+        train_total_D += float(abs(train_result[2][j] - train_label_D[j]))
+    train_total = train_total_L + train_total_W + train_total_D
+
+    print('---test---')
+    test_total_L = 0
+    test_total_W = 0
+    test_total_D = 0
+    for j in range(PRINT_NUMBER):
+        print('L', float(test_result[0][j]), '-', test_label_L[j], 'distance:', float(abs(test_result[0][j] - test_label_L[j])))
+        test_total_L += float(abs(test_result[0][j] - test_label_L[j]))
+        print('W', float(test_result[1][j]), '-', test_label_W[j], 'distance:', float(abs(test_result[1][j] - test_label_W[j])))
+        test_total_W += float(abs(test_result[1][j] - test_label_W[j]))
+        print('D', float(test_result[2][j]), '-', test_label_D[j], 'distance:', float(abs(test_result[2][j] - test_label_D[j])))
+        test_total_D += float(abs(test_result[2][j] - test_label_D[j]))
+    test_total = test_total_L + test_total_W + test_total_D
+
+    print('Training set length error(mm)：', train_total_L / PRINT_NUMBER)
+    print('Test set length error(mm)：', test_total_L  / PRINT_NUMBER)
+
+    print('Training set width error(mm)：', train_total_W / PRINT_NUMBER)
+    print('Test set width error(mm)：', test_total_W  / PRINT_NUMBER)
+
+    print('Training set width error(%)：', train_total_D / PRINT_NUMBER)
+    print('Test set width error(%)：', test_total_D  / PRINT_NUMBER)
+
+    print('--------------------------------')
+    print('Average error of training set：', train_total   / (PRINT_NUMBER * 3))
+    print('Average error of test set：', test_total    / (PRINT_NUMBER * 3))
+
+if __name__ == '__main__':
+    main()
