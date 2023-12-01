@@ -8,9 +8,9 @@ Paper Portal: However, not publish.
 
 Author: Hongyu Sun
 
-Affiliation: Tsinghua University
+Affiliation: Beijing Jiaotong University
 
-Email: sunhy18@mails.tsinghua.edu.cn
+Email: sunhy18@tsinghua.org.cn
 
 Abstract of our paper:
 
